@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 发送到微信
-        uses: fffxiong/send-to-wechat@main
+        uses: easychen/github-action-serverchan@v1.0.0
         with:
           sendkey: ${{ secrets.SCTKEY }}
           title: "📈 9:25 股票盯盘表"
