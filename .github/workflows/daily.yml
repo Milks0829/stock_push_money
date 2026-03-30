@@ -24,6 +24,7 @@ jobs:
           from datetime import datetime, timedelta
           import sys
           import time
+          import re
 
           # ===================== 强制北京时间 =====================
           utc_now = datetime.utcnow()
@@ -33,7 +34,7 @@ jobs:
           now = beijing_now
 
           if weekday >= 5:
-              print("今天周末，不推送")
+              print("MSG=今天周末，股市休市，不推送")
               sys.exit()
 
           holidays_2026 = {
@@ -45,7 +46,7 @@ jobs:
           }
 
           if today in holidays_2026:
-              print("今天节假日，不推送")
+              print("MSG=今天节假日，股市休市，不推送")
               sys.exit()
 
           stocks = [
@@ -61,70 +62,87 @@ jobs:
               ("601179", "sh", "中国西电")
           ]
 
-          # =============== 获取最新公告（静默失败，不抛错） ===============
+          # =============== 公告获取 ===============
           def get_stock_news(code):
               try:
-                  url = f"https://www.cninfo.com.cn/new/hisAnnouncement/query"
+                  url = "https://www.cninfo.com.cn/new/hisAnnouncement/query"
                   data = {"stock": code, "pageSize": 2, "pageNum": 1}
                   headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-                  r = requests.post(url, data=data, headers=headers, timeout=8)
+                  r = requests.post(url, data=data, headers=headers, timeout=10)
+                  r.raise_for_status()
                   data = r.json()
-                  announcements = []
-                  for ann in data.get("announcements", []):
-                      title = ann.get("announcementTitle", "")
-                      if len(title) > 5:
-                          announcements.append(title)
-                  return announcements[:2]
+                  return [ann["announcementTitle"] for ann in data.get("announcements", []) if len(ann.get("announcementTitle", "")) > 5][:2]
               except:
                   return []
 
           def judge_news_good_bad(title):
               good_key = ["预增", "扭亏", "盈利", "中标", "合同", "订单", "增持", "回购", "重组", "收购", "投产", "分红"]
               bad_key = ["亏损", "下降", "减持", "解禁", "立案", "处罚", "退市", "风险", "终止", "违约"]
-              is_good = any(k in title for k in good_key)
-              is_bad = any(k in title for k in bad_key)
-              if is_good:
+              if any(k in title for k in good_key):
                   return "✅ 利好"
-              elif is_bad:
+              elif any(k in title for k in bad_key):
                   return "❌ 利空"
               else:
                   return "ℹ️ 中性"
 
-          # =============== 获取股票数据（静默失败，不抛错） ===============
-          def get_stock_data(code, market, days=60):
+          # =============== 【双数据源兜底】主：akshare / 备：新浪财经 ===============
+          def get_stock_data_akshare(code, market, days=60):
               try:
                   symbol = f"{market}{code}"
                   end = now.strftime("%Y%m%d")
                   start = (now - timedelta(days=180)).strftime("%Y%m%d")
-                  # 增加重试+延时
-                  for i in range(3):
-                      try:
-                          df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start, end_date=end, adjust="qfq")
-                          if not df.empty and len(df) >= 30:
-                              break
-                          time.sleep(2)
-                      except:
-                          time.sleep(2)
+                  df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start, end_date=end, adjust="qfq")
                   if df.empty or len(df) < 30:
                       return None
                   df = df.rename(columns={
                       '日期':'date','开盘':'open','收盘':'close','最高':'high','最低':'low',
-                      '成交量':'volume','成交额':'amount','换手率':'turnover'
+                      '成交量':'volume','成交额':'amount'
                   })
                   df = df.tail(days).reset_index(drop=True)
                   return df
               except:
                   return None
 
+          def get_stock_data_sina(code, market, days=60):
+              try:
+                  sym = f"{market}{code}"
+                  url = f"https://quotes.sina.cn/api/stockapi/phpapi/api_chart.php?symbol={sym}&scale=240&datalen={days+20}"
+                  headers = {"User-Agent": "Mozilla/5.0"}
+                  r = requests.get(url, headers=headers, timeout=10)
+                  j = r.json()
+                  data = []
+                  for item in j.get("data", []):
+                      d = item.split(",")
+                      data.append({
+                          "date": pd.to_datetime(d[0]).strftime("%Y-%m-%d"),
+                          "open": float(d[1]),
+                          "high": float(d[3]),
+                          "low": float(d[4]),
+                          "close": float(d[2]),
+                          "volume": float(d[5]) if len(d) > 5 else 0,
+                          "amount": float(d[2])*float(d[5])*100 if len(d) >5 else 0
+                      })
+                  df = pd.DataFrame(data)
+                  if len(df) < 30:
+                      return None
+                  df = df.tail(days).reset_index(drop=True)
+                  return df
+              except:
+                  return None
+
+          def get_stock_data(code, market, days=60):
+              df = get_stock_data_akshare(code, market, days)
+              if df is not None:
+                  return df
+              return get_stock_data_sina(code, market, days)
+
           # =============== 主力成本 VWAP ===============
           def vwap_cost(df):
               try:
-                  df = df.tail(20)
-                  total_amount = df['amount'].sum()
-                  total_volume = df['volume'].sum()
-                  if total_volume <= 0:
-                      return None
-                  return round(total_amount / total_volume, 2)
+                  df20 = df.tail(20)
+                  total_amount = df20['amount'].sum()
+                  total_volume = df20['volume'].sum()
+                  return round(total_amount / total_volume, 2) if total_volume > 0 else None
               except:
                   return None
 
@@ -150,7 +168,7 @@ jobs:
           output += "✅ 真实K线 | 💎 主力成本 | 📢 公告利弊分析%0A%0A"
 
           for code, market, name in stocks:
-              time.sleep(1)  # 增加延时防风控
+              time.sleep(1)
               df = get_stock_data(code, market)
               news_list = get_stock_news(code)
               
@@ -169,10 +187,13 @@ jobs:
                   trend = "📉 空头排列"
               
               macd_st = "震荡"
-              if d.macd_line > d.macd_signal and df.iloc[-2].macd_line <= df.iloc[-2].macd_signal:
-                  macd_st = "✅ 金叉"
-              elif d.macd_line < d.macd_signal and df.iloc[-2].macd_line >= df.iloc[-2].macd_signal:
-                  macd_st = "❌ 死叉"
+              try:
+                  if d.macd_line > d.macd_signal and df.iloc[-2].macd_line <= df.iloc[-2].macd_signal:
+                      macd_st = "✅ 金叉"
+                  elif d.macd_line < d.macd_signal and df.iloc[-2].macd_line >= df.iloc[-2].macd_signal:
+                      macd_st = "❌ 死叉"
+              except:
+                  pass
               
               vol_st = "正常"
               if d.volume > d.vol_ma5 * 1.5:
@@ -216,11 +237,9 @@ jobs:
               output += f"{long}%0A{short}%0A"
               output += "────────────────────%0A%0A"
 
-          # 仅输出干净的 MSG= 行，避免错误日志混入
           print(f"MSG={output}")
           EOF
 
-          # 安全写入环境变量：仅提取最后一行 MSG= 内容
           python3 analyze.py > output.log
           MSG=$(grep "^MSG=" output.log | head -1)
           echo "$MSG" >> $GITHUB_ENV
