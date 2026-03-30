@@ -1,7 +1,7 @@
 name: 专业量化分析 - 最终完整版(真指标+主力成本+公告利弊)
 on:
   schedule:
-    - cron: '0 1 * * 1-5'  # UTC 1:00 = 北京时间 9:00
+    - cron: '0 1 * * 1-5'  # 北京时间9:00
   workflow_dispatch:
 
 jobs:
@@ -11,20 +11,19 @@ jobs:
       - name: 安装环境
         run: |
           apt update && apt install -y python3 python3-pip
-          pip3 install pandas numpy ta akshare requests
+          pip3 install pandas numpy ta tushare requests
 
-      - name: 运行量化+主力成本+公告分析
+      - name: 运行量化分析
         run: |
           cat > analyze.py << 'EOF'
           import pandas as pd
           import numpy as np
           import ta
-          import akshare as ak
+          import tushare as ts
           import requests
           from datetime import datetime, timedelta
           import sys
           import time
-          import re
 
           # ===================== 强制北京时间 =====================
           utc_now = datetime.utcnow()
@@ -34,7 +33,7 @@ jobs:
           now = beijing_now
 
           if weekday >= 5:
-              print("MSG=今天周末，股市休市，不推送")
+              print("MSG=今天周末，不推送")
               sys.exit()
 
           holidays_2026 = {
@@ -46,30 +45,38 @@ jobs:
           }
 
           if today in holidays_2026:
-              print("MSG=今天节假日，股市休市，不推送")
+              print("MSG=今天节假日，不推送")
               sys.exit()
 
+          ###########################################################
+          #
+          #  在这里填入你的 Tushare Token
+          #
+          ###########################################################
+          ts.set_token("57f868042fd4ef8ffdfd9b29bba61e694514425ec4df2ab07aff96dc")
+          pro = ts.pro_api()
+
           stocks = [
-              ("002446", "sz", "盛路通信"),
-              ("000063", "sz", "中兴通讯"),
-              ("603019", "sh", "中科曙光"),
-              ("002156", "sz", "通富微电"),
-              ("002463", "sz", "沪电股份"),
-              ("600183", "sh", "生益科技"),
-              ("600406", "sh", "国电南瑞"),
-              ("600089", "sh", "特变电工"),
-              ("002384", "sz", "东山精密"),
-              ("601179", "sh", "中国西电")
+              ("002446.SZ", "盛路通信"),
+              ("000063.SZ", "中兴通讯"),
+              ("603019.SH", "中科曙光"),
+              ("002156.SZ", "通富微电"),
+              ("002463.SZ", "沪电股份"),
+              ("600183.SH", "生益科技"),
+              ("600406.SH", "国电南瑞"),
+              ("600089.SH", "特变电工"),
+              ("002384.SZ", "东山精密"),
+              ("601179.SH", "中国西电")
           ]
 
           # =============== 公告获取 ===============
           def get_stock_news(code):
               try:
+                  code_short = code.split(".")[0]
                   url = "https://www.cninfo.com.cn/new/hisAnnouncement/query"
-                  data = {"stock": code, "pageSize": 2, "pageNum": 1}
-                  headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+                  data = {"stock": code_short, "pageSize": 2, "pageNum": 1}
+                  headers = {"User-Agent": "Mozilla/5.0"}
                   r = requests.post(url, data=data, headers=headers, timeout=10)
-                  r.raise_for_status()
                   data = r.json()
                   return [ann["announcementTitle"] for ann in data.get("announcements", []) if len(ann.get("announcementTitle", "")) > 5][:2]
               except:
@@ -85,64 +92,24 @@ jobs:
               else:
                   return "ℹ️ 中性"
 
-          # =============== 【双数据源兜底】主：akshare / 备：新浪财经 ===============
-          def get_stock_data_akshare(code, market, days=60):
+          # =============== 股票数据获取（Tushare 稳定版） ===============
+          def get_stock_data(code, days=60):
               try:
-                  symbol = f"{market}{code}"
-                  end = now.strftime("%Y%m%d")
-                  start = (now - timedelta(days=180)).strftime("%Y%m%d")
-                  df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start, end_date=end, adjust="qfq")
-                  if df.empty or len(df) < 30:
-                      return None
-                  df = df.rename(columns={
-                      '日期':'date','开盘':'open','收盘':'close','最高':'high','最低':'low',
-                      '成交量':'volume','成交额':'amount'
-                  })
-                  df = df.tail(days).reset_index(drop=True)
+                  end_date = now.strftime("%Y%m%d")
+                  start_date = (now - timedelta(days=180)).strftime("%Y%m%d")
+                  df = pro.daily(ts_code=code, start_date=start_date, end_date=end_date)
+                  df = df.rename(columns={'trade_date':'date','open':'open','close':'close','high':'high','low':'low','vol':'volume'})
+                  df['date'] = pd.to_datetime(df['date'], format='%Y%m%d')
+                  df = df.sort_values('date').tail(days).reset_index(drop=True)
                   return df
               except:
                   return None
-
-          def get_stock_data_sina(code, market, days=60):
-              try:
-                  sym = f"{market}{code}"
-                  url = f"https://quotes.sina.cn/api/stockapi/phpapi/api_chart.php?symbol={sym}&scale=240&datalen={days+20}"
-                  headers = {"User-Agent": "Mozilla/5.0"}
-                  r = requests.get(url, headers=headers, timeout=10)
-                  j = r.json()
-                  data = []
-                  for item in j.get("data", []):
-                      d = item.split(",")
-                      data.append({
-                          "date": pd.to_datetime(d[0]).strftime("%Y-%m-%d"),
-                          "open": float(d[1]),
-                          "high": float(d[3]),
-                          "low": float(d[4]),
-                          "close": float(d[2]),
-                          "volume": float(d[5]) if len(d) > 5 else 0,
-                          "amount": float(d[2])*float(d[5])*100 if len(d) >5 else 0
-                      })
-                  df = pd.DataFrame(data)
-                  if len(df) < 30:
-                      return None
-                  df = df.tail(days).reset_index(drop=True)
-                  return df
-              except:
-                  return None
-
-          def get_stock_data(code, market, days=60):
-              df = get_stock_data_akshare(code, market, days)
-              if df is not None:
-                  return df
-              return get_stock_data_sina(code, market, days)
 
           # =============== 主力成本 VWAP ===============
           def vwap_cost(df):
               try:
                   df20 = df.tail(20)
-                  total_amount = df20['amount'].sum()
-                  total_volume = df20['volume'].sum()
-                  return round(total_amount / total_volume, 2) if total_volume > 0 else None
+                  return round((df20['close'] * df20['volume']).sum() / df20['volume'].sum(), 2)
               except:
                   return None
 
@@ -163,29 +130,30 @@ jobs:
               df['vol_ma5'] = volume.rolling(5).mean()
               return df
 
-          # =============== 生成报告 ===============
-          output = f"📊 {today} 专业量化报告（全真实数据）%0A%0A"
-          output += "✅ 真实K线 | 💎 主力成本 | 📢 公告利弊分析%0A%0A"
+          # =============== 输出报告 ===============
+          output = f"📊 {today} 专业量化报告%0A%0A"
 
-          for code, market, name in stocks:
-              time.sleep(1)
-              df = get_stock_data(code, market)
+          for code, name in stocks:
+              time.sleep(0.5)
+              df = get_stock_data(code)
               news_list = get_stock_news(code)
-              
-              if df is None:
-                  output += f"⚠️ {name} 获取失败%0A────────────────────%0A"
+
+              if df is None or len(df) < 10:
+                  output += f"⚠️ {name} 获取失败%0A────────────────%0A"
                   continue
-              
+
               df = indicators(df)
               vwap = vwap_cost(df)
               d = df.iloc[-1]
-              
+
+              # 趋势
               trend = "震荡"
               if d.close > d.ma5 > d.ma10 > d.ma20:
                   trend = "📈 多头排列"
               elif d.close < d.ma5 < d.ma10 < d.ma20:
                   trend = "📉 空头排列"
-              
+
+              # MACD
               macd_st = "震荡"
               try:
                   if d.macd_line > d.macd_signal and df.iloc[-2].macd_line <= df.iloc[-2].macd_signal:
@@ -194,13 +162,15 @@ jobs:
                       macd_st = "❌ 死叉"
               except:
                   pass
-              
+
+              # 量能
               vol_st = "正常"
               if d.volume > d.vol_ma5 * 1.5:
                   vol_st = "🔥 放量"
               elif d.volume < d.vol_ma5 * 0.5:
                   vol_st = "📉 缩量"
-              
+
+              # 策略
               if trend == "📈 多头排列" and macd_st == "✅ 金叉":
                   long = "✅ 中长线：持股为主"
                   short = "✅ 短线：逢低关注"
@@ -216,26 +186,25 @@ jobs:
               else:
                   long = "📊 中长线：持有观望"
                   short = "📊 短线：区间操作"
-              
-              output += f"🔹 {name} ({code})%0A"
-              output += f"💰 收盘: {round(d.close,2)}%0A"
+
+              output += f"🔹 {name}%0A"
+              output += f"💰 收盘:{round(d.close,2)}%0A"
               output += f"📈 MA5:{round(d.ma5,2)} MA10:{round(d.ma10,2)} MA20:{round(d.ma20,2)}%0A"
               output += f"📊 趋势:{trend} | MACD:{macd_st} | RSI:{round(d.rsi,1)}%0A"
               output += f"🔋 量能:{vol_st}%0A"
               output += f"🛡️ 支撑:{round(d.bb_l,2)} | 阻力:{round(d.bb_u,2)}%0A"
-              
+
               if vwap:
                   cost_st = "✅ 现价在主力成本之上" if d.close > vwap else "⚠️ 现价在主力成本之下"
-                  output += f"💎 主力成本(VWAP): {vwap} | {cost_st}%0A"
-              
+                  output += f"💎 主力成本:{vwap} | {cost_st}%0A"
+
               if news_list:
-                  output += "📢 最新公告：%0A"
-                  for title in news_list:
-                      tag = judge_news_good_bad(title)
-                      output += f"{tag}：{title}%0A"
-              
+                  output += "📢 公告：%0A"
+                  for t in news_list:
+                      output += f"{judge_news_good_bad(t)}：{t}%0A"
+
               output += f"{long}%0A{short}%0A"
-              output += "────────────────────%0A%0A"
+              output += "────────────────%0A%0A"
 
           print(f"MSG={output}")
           EOF
@@ -248,5 +217,4 @@ jobs:
         if: env.MSG != ''
         run: |
           curl -s "https://sctapi.ftqq.com/${{ secrets.SCTKEY }}.send" \
-          -d "title=📈 9:00 全真实量化+公告分析" \
-          -d "desp=${MSG}"
+          -d "title=📈 A股专业量化报告" -d "desp=${MSG}"
